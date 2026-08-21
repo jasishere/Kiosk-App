@@ -1,0 +1,45 @@
+name: coinvert_kiosk
+description: Coinvert currency exchange kiosk UI (7" touchscreen LCD, Raspberry Pi 5).
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.6
+
+  # State management — controller is a plain ChangeNotifier, exposed
+  # to the widget tree via provider.
+  provider: ^6.1.2
+
+  # USB serial communication with the Arduino Mega. Works on Linux,
+  # which is what the Raspberry Pi 5 kiosk build targets. See
+  # PROTOCOL.md for the message format.
+  flutter_libserialport: ^0.4.0
+
+  # HTTP calls to the local Python/OpenCV AI authentication service
+  # (see python_reference/app.py).
+  http: ^1.2.1
+
+  # Cloud backend: transaction/error logging + admin auth, per the
+  # thesis's software design (Firebase section).
+  firebase_core: ^3.1.0
+  firebase_auth: ^5.1.0
+  cloud_firestore: ^5.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/coinvert_logo.png
+    - assets/coinvert_base.png
+    - assets/coinvert_arrow_green.png
+    - assets/coinvert_arrow_gold.png

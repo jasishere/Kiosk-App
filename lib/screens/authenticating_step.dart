@@ -1,53 +1,35 @@
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
 
-import '../theme/colors.dart';
-import '../state/kiosk_controller.dart';
-import '../widgets/buttons.dart';
+import '../theme/app_theme.dart';
 
+/// Shown while a note sits in escrow under the UV camera.
+///
+/// Deliberately short on detail: the customer cannot act here, the wait is a
+/// second or two, and narrating the classifier's internals ("running YOLOv8
+/// inference") only invites the question of what happens when it is wrong.
 class AuthenticatingStep extends StatelessWidget {
   const AuthenticatingStep({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final aiOnline =
-        context.select<KioskController, bool>((c) => c.aiServiceOnline);
-
-    return Column(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        const Icon(Icons.document_scanner_outlined, size: 38, color: AppColors.green),
-        const SizedBox(height: 12),
-        const Text(
-          'Verifying banknote',
-          style: TextStyle(
-            fontSize: 23,
-            fontWeight: FontWeight.w700,
-            letterSpacing: -0.2,
-            color: AppColors.textPrimary,
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const SizedBox(
+            width: 52,
+            height: 52,
+            child: CircularProgressIndicator(
+              strokeWidth: 4,
+              color: AppColors.green,
+            ),
           ),
-        ),
-        const SizedBox(height: 4),
-        Text(
-          uppercaseLabel(
-            aiOnline ? 'AI authentication in progress' : 'Falling back to basic checks',
-          ),
-          style: const TextStyle(
-            fontSize: 12,
-            color: AppColors.textSecondary,
-            letterSpacing: 1.0,
-          ),
-        ),
-        const SizedBox(height: 12),
-        const SizedBox(
-          width: 220,
-          height: 3,
-          child: LinearProgressIndicator(
-            backgroundColor: AppColors.screenBorder,
-            valueColor: AlwaysStoppedAnimation(AppColors.green),
-          ),
-        ),
-      ],
+          const SizedBox(height: AppSpace.lg),
+          Text('Checking your note', style: AppText.title),
+          const SizedBox(height: AppSpace.xs),
+          Text('This takes a moment. Please hold on.', style: AppText.body),
+        ],
+      ),
     );
   }
 }

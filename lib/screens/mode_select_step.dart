@@ -1,9 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
-import '../theme/colors.dart';
 import '../state/kiosk_controller.dart';
-import '../widgets/buttons.dart';
+import '../theme/app_theme.dart';
 
 class ModeSelectStep extends StatelessWidget {
   const ModeSelectStep({super.key});
@@ -11,56 +10,47 @@ class ModeSelectStep extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final controller = context.read<KioskController>();
+    final acceptsNotes =
+        context.select<KioskController, bool>((c) => c.acceptsNotes);
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text(
-          'What would you like to do?',
-          style: TextStyle(
-            fontSize: 25,
-            fontWeight: FontWeight.w700,
-            letterSpacing: -0.4,
-            color: AppColors.textPrimary,
-          ),
-        ),
-        const SizedBox(height: 4),
+        Text('What do you need?', style: AppText.title),
+        const SizedBox(height: AppSpace.xs),
         Text(
-          uppercaseLabel('Select an exchange mode'),
-          style: const TextStyle(
-            fontSize: 12,
-            color: AppColors.textSecondary,
-            letterSpacing: 1.4,
-          ),
+          'Pick one to begin. You can put in coins and notes together.',
+          style: AppText.body,
         ),
-        const SizedBox(height: 16),
+        if (!acceptsNotes) ...[
+          const SizedBox(height: AppSpace.md),
+          const _CoinsOnlyBanner(),
+        ],
+        const SizedBox(height: AppSpace.lg),
         Expanded(
           child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               Expanded(
                 child: _ModeCard(
-                  icon: Icons.paid_outlined,
-                  iconColor: AppColors.green,
-                  iconBg: AppColors.greenTint,
-                  topBorderColor: AppColors.green,
+                  icon: Icons.call_split,
+                  accent: AppColors.green,
+                  tint: AppColors.greenTint,
                   title: 'Pabarya',
-                  description: 'Break a bill into coins and smaller cash',
-                  footnote: '₱20 and up only',
-                  footnoteColor: AppColors.green,
+                  subtitle: 'Break your cash into coins and smaller notes',
+                  note: 'Needs at least ₱20',
                   onTap: () => controller.selectMode(ExchangeMode.pabarya),
                 ),
               ),
-              const SizedBox(width: 12),
+              const SizedBox(width: AppSpace.lg),
               Expanded(
                 child: _ModeCard(
-                  icon: Icons.payments_outlined,
-                  iconColor: AppColors.goldDark,
-                  iconBg: AppColors.goldTint,
-                  topBorderColor: AppColors.goldDark,
+                  icon: Icons.call_merge,
+                  accent: AppColors.gold,
+                  tint: AppColors.goldTint,
                   title: 'Pabuo',
-                  description: 'Combine coins and bills into a bigger bill',
-                  footnote: 'Any mix accepted',
-                  footnoteColor: AppColors.goldDark,
+                  subtitle: 'Turn coins and small notes into bigger notes',
+                  note: 'Any amount',
                   onTap: () => controller.selectMode(ExchangeMode.pabuo),
                 ),
               ),
@@ -72,101 +62,110 @@ class ModeSelectStep extends StatelessWidget {
   }
 }
 
-class _ModeCard extends StatelessWidget {
+class _CoinsOnlyBanner extends StatelessWidget {
+  const _CoinsOnlyBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(AppSpace.md),
+      decoration: BoxDecoration(
+        color: AppColors.goldTint,
+        borderRadius: BorderRadius.circular(AppRadius.control),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.info_outline, size: 20, color: AppColors.gold),
+          const SizedBox(width: AppSpace.sm),
+          Expanded(
+            child: Text(
+              'Note checking is offline, so the kiosk is taking coins only '
+              'right now. You can still be paid out in notes.',
+              style: AppText.caption.copyWith(color: AppColors.gold),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ModeCard extends StatefulWidget {
   final IconData icon;
-  final Color iconColor;
-  final Color iconBg;
-  final Color topBorderColor;
+  final Color accent;
+  final Color tint;
   final String title;
-  final String description;
-  final String footnote;
-  final Color footnoteColor;
+  final String subtitle;
+  final String note;
   final VoidCallback onTap;
 
   const _ModeCard({
     required this.icon,
-    required this.iconColor,
-    required this.iconBg,
-    required this.topBorderColor,
+    required this.accent,
+    required this.tint,
     required this.title,
-    required this.description,
-    required this.footnote,
-    required this.footnoteColor,
+    required this.subtitle,
+    required this.note,
     required this.onTap,
   });
 
   @override
+  State<_ModeCard> createState() => _ModeCardState();
+}
+
+class _ModeCardState extends State<_ModeCard> {
+  bool _pressed = false;
+
+  @override
   Widget build(BuildContext context) {
-    return Material(
-      color: Colors.white,
-      borderRadius: BorderRadius.circular(14),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(14),
-        onTap: onTap,
-        child: Container(
-          padding: const EdgeInsets.all(18),
-          decoration: BoxDecoration(
-            border: Border.all(color: AppColors.screenBorder),
-            borderRadius: BorderRadius.circular(14),
-          ),
-          child: Stack(
-            children: [
-              Positioned(
-                top: -18,
-                left: -18,
-                right: -18,
-                child: Container(height: 4, color: topBorderColor),
-              ),
-              Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Container(
-                        width: 34,
-                        height: 34,
-                        decoration: BoxDecoration(
-                          color: iconBg,
-                          borderRadius: BorderRadius.circular(9),
-                        ),
-                        child: Icon(icon, size: 18, color: iconColor),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Text(
-                          title,
-                          style: const TextStyle(
-                            fontSize: 23,
-                            fontWeight: FontWeight.w700,
-                            letterSpacing: -0.2,
-                            color: AppColors.textPrimary,
-                          ),
-                        ),
-                      ),
-                    ],
+    return AnimatedScale(
+      scale: _pressed ? 0.98 : 1.0,
+      duration: const Duration(milliseconds: 100),
+      child: Material(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(AppRadius.panel),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: widget.onTap,
+          onHighlightChanged: (v) => setState(() => _pressed = v),
+          child: Container(
+            decoration: BoxDecoration(
+              border: Border.all(color: AppColors.hairline),
+              borderRadius: BorderRadius.circular(AppRadius.panel),
+            ),
+            padding: const EdgeInsets.all(AppSpace.lg),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  width: 68,
+                  height: 68,
+                  decoration: BoxDecoration(
+                    color: widget.tint,
+                    borderRadius: BorderRadius.circular(AppRadius.control),
                   ),
-                  const SizedBox(height: 8),
-                  Text(
-                    description,
-                    style: const TextStyle(
-                      fontSize: 12,
-                      color: AppColors.textSecondary,
-                      height: 1.4,
-                    ),
+                  child: Icon(widget.icon, size: 34, color: widget.accent),
+                ),
+                const Spacer(),
+                Text(
+                  widget.title,
+                  style: AppText.title.copyWith(fontSize: 34),
+                ),
+                const SizedBox(height: AppSpace.sm),
+                Text(
+                  widget.subtitle,
+                  style: AppText.body.copyWith(fontSize: 17),
+                ),
+                const SizedBox(height: AppSpace.md),
+                Text(
+                  widget.note,
+                  style: AppText.caption.copyWith(
+                    color: widget.accent,
+                    fontWeight: FontWeight.w700,
                   ),
-                  const SizedBox(height: 6),
-                  Text(
-                    footnote,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: footnoteColor,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ],
-              ),
-            ],
+                ),
+              ],
+            ),
           ),
         ),
       ),

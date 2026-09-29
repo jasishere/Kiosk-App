@@ -1,45 +1,71 @@
 import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
-import '../theme/colors.dart';
 import '../models/kiosk_step.dart';
-import '../state/kiosk_controller.dart';
-import '../screens/welcome_step.dart';
-import '../screens/mode_select_step.dart';
-import '../screens/insert_cash_step.dart';
 import '../screens/authenticating_step.dart';
-import '../screens/select_output_step.dart';
-import '../screens/dispensing_step.dart';
 import '../screens/complete_step.dart';
+import '../screens/dispensing_step.dart';
+import '../screens/insert_cash_step.dart';
+import '../screens/mode_select_step.dart';
+import '../screens/out_of_service_step.dart';
+import '../screens/select_output_step.dart';
+import '../screens/welcome_step.dart';
+import '../state/kiosk_controller.dart';
+import '../theme/app_theme.dart';
+import 'ledger_rail.dart';
 
-/// The device frame: status bar (clock/wifi/battery) + content area.
-/// Reads the current step from KioskController — no local nav state.
+/// Outer chrome: a slim status strip, the step content, and — once a
+/// transaction is underway — a persistent ledger rail down the right.
+///
+/// The rail is the structural idea the rest of the layout is built around.
+/// Every screen in the old build re-stated the amount in its own way, which
+/// meant the customer had to re-find their money on each step. Here it lives
+/// in one fixed place from the moment the first coin drops until the cash is
+/// in the tray.
 class KioskFrame extends StatelessWidget {
   const KioskFrame({super.key});
 
   @override
   Widget build(BuildContext context) {
     final step = context.select<KioskController, KioskStep>((c) => c.step);
+    final showLedger = step.isTransactional ||
+        step == KioskStep.dispensing ||
+        step == KioskStep.complete;
 
     return Container(
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: [AppColors.screenBg, AppColors.greenTint.withValues(alpha: 0.35)],
-        ),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: AppColors.screenBorder),
-      ),
-      clipBehavior: Clip.antiAlias,
+      color: AppColors.canvas,
       child: Column(
         children: [
-          const _StatusBar(),
+          const _StatusStrip(),
           Expanded(
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(26, 14, 26, 22),
-              child: _StepBody(step: step),
+              padding: const EdgeInsets.fromLTRB(
+                AppSpace.xl,
+                AppSpace.md,
+                AppSpace.xl,
+                AppSpace.xl,
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Expanded(child: _StepBody(step: step)),
+                  // Animated width rather than a conditional child: the rail
+                  // slides in and out instead of the content jumping sideways
+                  // the instant the step changes.
+                  AnimatedSize(
+                    duration: const Duration(milliseconds: 320),
+                    curve: Curves.easeOutCubic,
+                    child: showLedger
+                        ? const Padding(
+                            padding: EdgeInsets.only(left: AppSpace.lg),
+                            child: LedgerRail(),
+                          )
+                        : const SizedBox(height: double.infinity),
+                  ),
+                ],
+              ),
             ),
           ),
         ],
@@ -48,83 +74,84 @@ class KioskFrame extends StatelessWidget {
   }
 }
 
-/// Live status bar — everything shown here comes from real
-/// KioskController/system state, not placeholders. WiFi and battery
-/// icons from the original mockup were removed: a Pi-powered kiosk on
-/// mains power with no OS-level wifi signal exposed to Flutter has no
-/// real value to show for either, and faking them was actively
-/// misleading about the device's actual state.
-class _StatusBar extends StatefulWidget {
-  const _StatusBar();
+/// Clock plus two honest hardware indicators.
+///
+/// The mockup's wifi and battery glyphs are gone: a mains-powered Pi exposes
+/// neither to Flutter, so both were decoration that actively misrepresented
+/// the machine's state. What replaces them is the only two things an
+/// attendant walking past actually needs to see.
+class _StatusStrip extends StatefulWidget {
+  const _StatusStrip();
 
   @override
-  State<_StatusBar> createState() => _StatusBarState();
+  State<_StatusStrip> createState() => _StatusStripState();
 }
 
-class _StatusBarState extends State<_StatusBar> {
+class _StatusStripState extends State<_StatusStrip> {
   late DateTime _now = DateTime.now();
-  Timer? _clockTimer;
+  Timer? _clock;
 
   @override
   void initState() {
     super.initState();
-    _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+    // Ticks on the minute boundary rather than every second — the display
+    // only shows hours and minutes, so a 1 Hz setState was rebuilding the
+    // strip sixty times for every visible change.
+    _scheduleTick();
+  }
+
+  void _scheduleTick() {
+    final now = DateTime.now();
+    final next = DateTime(now.year, now.month, now.day, now.hour, now.minute)
+        .add(const Duration(minutes: 1));
+    _clock = Timer(next.difference(now), () {
+      if (!mounted) return;
       setState(() => _now = DateTime.now());
+      _scheduleTick();
     });
   }
 
   @override
   void dispose() {
-    _clockTimer?.cancel();
+    _clock?.cancel();
     super.dispose();
   }
 
   String get _timeLabel {
-    final h = _now.hour.toString().padLeft(2, '0');
+    final h = _now.hour % 12 == 0 ? 12 : _now.hour % 12;
     final m = _now.minute.toString().padLeft(2, '0');
-    return '$h:$m';
+    return '$h:$m ${_now.hour < 12 ? 'am' : 'pm'}';
   }
 
   @override
   Widget build(BuildContext context) {
-    final hardwareOk =
+    final hardware =
         context.select<KioskController, bool>((c) => c.hardwareConnected);
-    final aiOk =
-        context.select<KioskController, bool>((c) => c.aiServiceOnline);
+    final classifier =
+        context.select<KioskController, bool>((c) => c.classifierOnline);
 
     return Container(
-      height: 32,
-      padding: const EdgeInsets.symmetric(horizontal: 20),
+      height: 44,
+      padding: const EdgeInsets.symmetric(horizontal: AppSpace.xl),
+      alignment: Alignment.center,
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(
-            _timeLabel,
-            style: const TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w700,
-              color: AppColors.statusIcon,
-              letterSpacing: 0.4,
-            ),
-          ),
+          Text(_timeLabel, style: AppText.caption),
           Row(
             children: [
-              Tooltip(
-                message: hardwareOk ? 'Hardware connected' : 'Hardware offline',
-                child: Icon(
-                  Icons.memory,
-                  size: 14,
-                  color: hardwareOk ? AppColors.statusIcon : Colors.red,
-                ),
+              _Indicator(
+                icon: Icons.developer_board,
+                ok: hardware,
+                okLabel: 'Hardware connected',
+                badLabel: 'Hardware offline',
               ),
-              const SizedBox(width: 6),
-              Tooltip(
-                message: aiOk ? 'AI service online' : 'AI service offline',
-                child: Icon(
-                  Icons.smart_toy_outlined,
-                  size: 14,
-                  color: aiOk ? AppColors.statusIcon : Colors.red,
-                ),
+              const SizedBox(width: AppSpace.md),
+              _Indicator(
+                icon: Icons.center_focus_strong,
+                ok: classifier,
+                okLabel: 'Note checking online',
+                badLabel: 'Note checking offline — coins only',
               ),
             ],
           ),
@@ -134,9 +161,32 @@ class _StatusBarState extends State<_StatusBar> {
   }
 }
 
-/// Dispatches to the correct step widget based on real controller state,
-/// cross-fading + sliding between them so moving through the transaction
-/// flow feels alive rather than snapping instantly step to step.
+class _Indicator extends StatelessWidget {
+  final IconData icon;
+  final bool ok;
+  final String okLabel;
+  final String badLabel;
+
+  const _Indicator({
+    required this.icon,
+    required this.ok,
+    required this.okLabel,
+    required this.badLabel,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: ok ? okLabel : badLabel,
+      child: Icon(
+        icon,
+        size: 17,
+        color: ok ? AppColors.textMuted : AppColors.danger,
+      ),
+    );
+  }
+}
+
 class _StepBody extends StatelessWidget {
   final KioskStep step;
   const _StepBody({required this.step});
@@ -144,46 +194,34 @@ class _StepBody extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return AnimatedSwitcher(
-      duration: const Duration(milliseconds: 460),
+      duration: const Duration(milliseconds: 340),
       switchInCurve: Curves.easeOutCubic,
-      switchOutCurve: Curves.easeInCubic,
-      transitionBuilder: (child, animation) {
-        final slide = Tween<Offset>(
-          begin: const Offset(0, 0.06),
-          end: Offset.zero,
-        ).animate(animation);
-        final scale = Tween<double>(begin: 0.97, end: 1.0).animate(animation);
-        return FadeTransition(
-          opacity: animation,
-          child: SlideTransition(
-            position: slide,
-            child: ScaleTransition(scale: scale, child: child),
-          ),
-        );
-      },
-      child: KeyedSubtree(
-        key: ValueKey(step),
-        child: _stepWidget(step),
+      switchOutCurve: Curves.easeIn,
+      // Motion that answers the customer's action: content rises slightly as
+      // it arrives. No scale — combining fade, slide and scale on every step
+      // reads as a transition effect rather than a response.
+      transitionBuilder: (child, animation) => FadeTransition(
+        opacity: animation,
+        child: SlideTransition(
+          position: Tween<Offset>(
+            begin: const Offset(0, 0.04),
+            end: Offset.zero,
+          ).animate(animation),
+          child: child,
+        ),
       ),
+      child: KeyedSubtree(key: ValueKey(step), child: _widgetFor(step)),
     );
   }
 
-  Widget _stepWidget(KioskStep step) {
-    switch (step) {
-      case KioskStep.welcome:
-        return const WelcomeStep();
-      case KioskStep.modeSelect:
-        return const ModeSelectStep();
-      case KioskStep.insertCash:
-        return const InsertCashStep();
-      case KioskStep.authenticating:
-        return const AuthenticatingStep();
-      case KioskStep.selectOutput:
-        return const SelectOutputStep();
-      case KioskStep.dispensing:
-        return const DispensingStep();
-      case KioskStep.complete:
-        return const CompleteStep();
-    }
-  }
+  Widget _widgetFor(KioskStep step) => switch (step) {
+        KioskStep.welcome => const WelcomeStep(),
+        KioskStep.modeSelect => const ModeSelectStep(),
+        KioskStep.insertCash => const InsertCashStep(),
+        KioskStep.authenticating => const AuthenticatingStep(),
+        KioskStep.selectOutput => const SelectOutputStep(),
+        KioskStep.dispensing => const DispensingStep(),
+        KioskStep.complete => const CompleteStep(),
+        KioskStep.outOfService => const OutOfServiceStep(),
+      };
 }

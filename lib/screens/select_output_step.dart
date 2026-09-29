@@ -1,185 +1,251 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
-import '../theme/colors.dart';
+import '../models/denomination.dart';
+import '../state/change_planner.dart';
 import '../state/kiosk_controller.dart';
+import '../theme/app_theme.dart';
 import '../widgets/buttons.dart';
-
-/// Standard PHP bill denominations the dispenser stocks, largest first.
-/// ₱20 and up only, matching the kiosk's accepted-input floor.
-const _kDenominations = [1000, 500, 200, 100, 50, 20];
-
-/// Greedy denomination breakdown — simplest correct approach for a
-/// kiosk dispenser with unlimited-looking stock. Swap for a
-/// stock-aware algorithm once you wire in live inventory counts from
-/// FirebaseService.watchInventory().
-Map<int, int> _greedyBreakdown(int amount) {
-  final result = <int, int>{};
-  var remaining = amount;
-  for (final denom in _kDenominations) {
-    final count = remaining ~/ denom;
-    if (count > 0) {
-      result[denom] = count;
-      remaining -= denom * count;
-    }
-  }
-  return result;
-}
+import '../widgets/custom_mix_sheet.dart';
 
 class SelectOutputStep extends StatelessWidget {
   const SelectOutputStep({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final controller = context.read<KioskController>();
-    final amount =
-        context.select<KioskController, int>((c) => c.amountInsertedPesos);
-    final quickMix = _greedyBreakdown(amount);
-    final quickMixLabel = quickMix.entries
-        .map((e) => '${e.value}x ₱${e.key}')
-        .join(', ');
+    final controller = context.watch<KioskController>();
+
+    // Read the cached plan — planning is pure and memoised on the
+    // controller. The old build called the planner inside build(), and that
+    // planner wrote a Firestore alert whenever stock was short, so every
+    // rebuild of this screen fired another document write.
+    final plan = controller.proposedPlan;
+    final canConfirm = controller.canConfirmPayout;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        Text('How would you like it?', style: AppText.title),
+        const SizedBox(height: AppSpace.xs),
         Text(
-          '₱${amount.toStringAsFixed(2)}',
-          style: const TextStyle(
-            fontSize: 32,
-            fontWeight: FontWeight.w700,
-            letterSpacing: -0.4,
-            color: AppColors.goldDark,
-          ),
+          controller.mode == ExchangeMode.pabarya
+              ? 'We will give you the smallest pieces we can.'
+              : 'We will give you the fewest notes we can.',
+          style: AppText.body,
         ),
-        const SizedBox(height: 2),
-        Text(
-          uppercaseLabel('Received — choose your output'),
-          style: const TextStyle(
-            fontSize: 12,
-            color: AppColors.textSecondary,
-            letterSpacing: 1.0,
-          ),
-        ),
-        const SizedBox(height: 14),
+
+        if (controller.hasShortfall) ...[
+          const SizedBox(height: AppSpace.md),
+          _ShortfallWarning(shortfall: plan.shortfall),
+        ],
+
+        const SizedBox(height: AppSpace.lg),
+
         Expanded(
           child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               Expanded(
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(14),
-                  onTap: () => controller.confirmOutput(quickMix),
-                  child: Container(
-                    padding: const EdgeInsets.all(16),
-                    decoration: BoxDecoration(
-                      color: AppColors.dark,
-                      borderRadius: BorderRadius.circular(14),
-                    ),
-                    child: Stack(
-                      children: [
-                        Positioned(
-                          top: -16,
-                          left: -16,
-                          right: -16,
-                          child: Container(height: 4, color: AppColors.green),
-                        ),
-                        Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text(
-                              'Quick mix',
-                              style: TextStyle(
-                                fontSize: 22,
-                                fontWeight: FontWeight.w700,
-                                letterSpacing: -0.2,
-                                color: Colors.white,
-                              ),
-                            ),
-                            Text(
-                              quickMixLabel.isEmpty ? '—' : quickMixLabel,
-                              style: const TextStyle(
-                                fontSize: 12,
-                                color: AppColors.mutedOnDark,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ),
+                flex: 3,
+                child: _RecommendedCard(
+                  plan: plan,
+                  modeTitle: controller.mode == ExchangeMode.pabarya
+                      ? 'Smallest pieces'
+                      : 'Fewest notes',
                 ),
               ),
-              const SizedBox(width: 12),
+              const SizedBox(width: AppSpace.lg),
               Expanded(
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(14),
-                  onTap: () {
-                    // TODO: replace with a real denomination picker
-                    // (bottom sheet or dedicated screen) that lets the
-                    // user adjust counts per denomination, then calls
-                    // controller.confirmOutput(customBreakdown).
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('Custom mix picker not built yet — use Quick mix'),
-                      ),
-                    );
-                  },
-                  child: Container(
-                    padding: const EdgeInsets.all(16),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      border: Border.all(color: AppColors.screenBorder),
-                      borderRadius: BorderRadius.circular(14),
-                    ),
-                    child: Stack(
-                      children: [
-                        Positioned(
-                          top: -16,
-                          left: -16,
-                          right: -16,
-                          child: Container(height: 4, color: AppColors.goldDark),
-                        ),
-                        const Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Custom mix',
-                              style: TextStyle(
-                                fontSize: 22,
-                                fontWeight: FontWeight.w700,
-                                letterSpacing: -0.2,
-                                color: AppColors.textPrimary,
-                              ),
-                            ),
-                            Text(
-                              'Choose your own combination',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: AppColors.textSecondary,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ),
+                flex: 2,
+                child: _CustomCard(
+                  enabled: controller.payableAmount > 0,
+                  onTap: () => _openCustomMix(context, controller),
                 ),
               ),
             ],
           ),
         ),
-        const SizedBox(height: 12),
-        SizedBox(
-          width: double.infinity,
-          height: 42,
-          child: PrimaryButton(
-            label: uppercaseLabel('Confirm quick mix'),
-            onPressed: () => controller.confirmOutput(quickMix),
-            padding: EdgeInsets.zero,
-          ),
+
+        const SizedBox(height: AppSpace.lg),
+        PrimaryButton(
+          label: canConfirm
+              ? 'Give me ${peso(controller.payableAmount)}'
+              : 'Not available right now',
+          icon: canConfirm ? Icons.arrow_forward : null,
+          onPressed: canConfirm ? () => controller.confirmPayout(plan) : null,
+          fullWidth: true,
         ),
       ],
+    );
+  }
+
+  Future<void> _openCustomMix(
+    BuildContext context,
+    KioskController controller,
+  ) async {
+    final chosen = await showModalBottomSheet<DispensePlan>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(
+          top: Radius.circular(AppRadius.frame),
+        ),
+      ),
+      builder: (_) => CustomMixSheet(
+        payout: controller.payableAmount,
+        stock: controller.firebase.stockSnapshot(),
+      ),
+    );
+
+    if (chosen == null) return;
+    // Guard the async gap: the customer could have been timed out, or the
+    // hardware could have dropped, while the sheet was open.
+    if (!context.mounted) return;
+    await controller.confirmPayout(chosen);
+  }
+}
+
+/// Disclosed *before* the customer commits, not filed as an alert they will
+/// never see. The old behaviour dispensed the short amount anyway and logged
+/// the gap to Firestore.
+class _ShortfallWarning extends StatelessWidget {
+  final int shortfall;
+  const _ShortfallWarning({required this.shortfall});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(AppSpace.md),
+      decoration: BoxDecoration(
+        color: AppColors.dangerTint,
+        borderRadius: BorderRadius.circular(AppRadius.control),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.report_outlined, size: 20, color: AppColors.danger),
+          const SizedBox(width: AppSpace.sm),
+          Expanded(
+            child: Text(
+              'This kiosk is ${peso(shortfall)} short of your exact amount. '
+              'Please ask the attendant before continuing.',
+              style: AppText.bodyStrong.copyWith(color: AppColors.danger),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RecommendedCard extends StatelessWidget {
+  final DispensePlan plan;
+  final String modeTitle;
+  const _RecommendedCard({required this.plan, required this.modeTitle});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(AppSpace.lg),
+      decoration: BoxDecoration(
+        color: AppColors.ink,
+        borderRadius: BorderRadius.circular(AppRadius.panel),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            modeTitle,
+            style: AppText.bodyStrong.copyWith(color: AppColors.onInkMuted),
+          ),
+          const SizedBox(height: AppSpace.lg),
+          Expanded(
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  for (final entry in _sorted(plan))
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: AppSpace.sm),
+                      child: Row(
+                        children: [
+                          SizedBox(
+                            width: 52,
+                            child: Text(
+                              '${entry.value}×',
+                              style: AppText.moneySmall
+                                  .copyWith(color: AppColors.onInk),
+                            ),
+                          ),
+                          Text(
+                            entry.key.label,
+                            style: AppText.body.copyWith(
+                              color: AppColors.onInk,
+                              fontSize: 17,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  if (plan.units.isEmpty)
+                    Text(
+                      'Nothing can be dispensed at the moment.',
+                      style: AppText.body.copyWith(color: AppColors.onInkMuted),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  List<MapEntry<DispenseSlot, int>> _sorted(DispensePlan plan) {
+    return plan.units.entries.toList()
+      ..sort((a, b) => b.key.value.compareTo(a.key.value));
+  }
+}
+
+class _CustomCard extends StatelessWidget {
+  final bool enabled;
+  final VoidCallback onTap;
+  const _CustomCard({required this.enabled, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: AppColors.surface,
+      borderRadius: BorderRadius.circular(AppRadius.panel),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: enabled ? onTap : null,
+        child: Container(
+          decoration: BoxDecoration(
+            border: Border.all(color: AppColors.hairline),
+            borderRadius: BorderRadius.circular(AppRadius.panel),
+          ),
+          padding: const EdgeInsets.all(AppSpace.lg),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Icon(Icons.tune, size: 34, color: AppColors.gold),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Pick it myself', style: AppText.heading),
+                  const SizedBox(height: AppSpace.xs),
+                  Text(
+                    'Choose exactly which notes and coins you want.',
+                    style: AppText.body,
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

@@ -1,11 +1,19 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
-import '../theme/colors.dart';
 import '../state/kiosk_controller.dart';
+import '../theme/app_theme.dart';
 import '../widgets/logo_badge.dart';
-import '../widgets/welcome_decor.dart';
 
+/// The attract screen. This is what the kiosk displays for the overwhelming
+/// majority of its runtime, which drives two decisions:
+///
+///  - One orchestrated entrance, then stillness. The old version ran a
+///    14-particle CustomPainter and a shimmer sweep on repeating controllers
+///    that never stopped, so an idle kiosk repainted at 60fps indefinitely.
+///    On a passively-cooled Pi 5 behind glass that is real heat for
+///    decoration nobody is watching.
+///  - One unmistakable target. Everything else is quiet.
 class WelcomeStep extends StatefulWidget {
   const WelcomeStep({super.key});
 
@@ -14,185 +22,142 @@ class WelcomeStep extends StatefulWidget {
 }
 
 class _WelcomeStepState extends State<WelcomeStep>
-    with TickerProviderStateMixin {
-  // Staggered entrance: logo scales/fades in first, wordmark and subtitle
-  // fade-slide up shortly after, then the CTA fades in.
+    with SingleTickerProviderStateMixin {
   late final AnimationController _entrance = AnimationController(
     vsync: this,
-    duration: const Duration(milliseconds: 1100),
+    duration: const Duration(milliseconds: 900),
   )..forward();
-
-  // Gentle continuous "breathing" once things have landed — the whole
-  // logo group drifts up/down a couple px and the CTA's glow pulses.
-  // Idle motion, not attention-grabbing, so the screen still feels alive
-  // while someone decides to walk up and tap it.
-  late final AnimationController _idle = AnimationController(
-    vsync: this,
-    duration: const Duration(milliseconds: 2600),
-  )..repeat(reverse: true);
-
-  // Momentary press feedback on the CTA.
-  bool _pressed = false;
-
-  Animation<double> _fadeSlide(double startFraction, double endFraction) =>
-      CurvedAnimation(
-        parent: _entrance,
-        curve: Interval(startFraction, endFraction, curve: Curves.easeOutCubic),
-      );
 
   @override
   void dispose() {
     _entrance.dispose();
-    _idle.dispose();
     super.dispose();
   }
+
+  Animation<double> _stage(double begin, double end) => CurvedAnimation(
+        parent: _entrance,
+        curve: Interval(begin, end, curve: Curves.easeOutCubic),
+      );
 
   @override
   Widget build(BuildContext context) {
     final controller = context.read<KioskController>();
-    final logoAnim = _fadeSlide(0.0, 0.55);
-    final textAnim = _fadeSlide(0.35, 0.8);
-    final ctaAnim = _fadeSlide(0.65, 1.0);
+    final mark = _stage(0.0, 0.55);
+    final word = _stage(0.25, 0.8);
+    final cta = _stage(0.55, 1.0);
 
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        // Scale the whole composition off the available height so it
-        // fills a tall kiosk panel instead of huddling at a fixed size
-        // with dead space around it, while staying sane on a smaller
-        // preview frame.
-        final scale = (constraints.maxHeight / 560).clamp(0.85, 1.55);
-        double s(double v) => v * scale;
-
-        return Stack(
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 620),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            // Faint security-paper dot texture across the whole step —
-            // felt more than seen.
-            Positioned.fill(
-              child: CustomPaint(
-                painter: DotGridPainter(
-                  color: AppColors.textPrimary.withValues(alpha: 0.025),
-                  spacing: s(22),
-                ),
+            FadeTransition(
+              opacity: mark,
+              child: ScaleTransition(
+                scale: Tween(begin: 0.85, end: 1.0).animate(mark),
+                child: const LogoBadge(size: 120),
               ),
             ),
-            Center(
-              child: SingleChildScrollView(
-                physics: const NeverScrollableScrollPhysics(),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.center,
-                  children: [
-                    ScaleTransition(
-                      scale: Tween(begin: 0.55, end: 1.0).animate(
-                        CurvedAnimation(
-                          parent: _entrance,
-                          curve: const Interval(0.0, 0.6, curve: Curves.elasticOut),
-                        ),
+            const SizedBox(height: AppSpace.lg),
+            FadeTransition(
+              opacity: word,
+              child: Column(
+                children: [
+                  RichText(
+                    text: const TextSpan(
+                      style: TextStyle(
+                        fontSize: 64,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: -2.2,
+                        height: 1.0,
+                        fontFamily: 'Roboto',
                       ),
-                      child: FadeTransition(
-                        opacity: logoAnim,
-                        child: AnimatedBuilder(
-                          animation: _idle,
-                          builder: (context, child) => Transform.translate(
-                            offset: Offset(0, -_idle.value * s(5)),
-                            child: child,
-                          ),
-                          child: LogoBadge(size: s(96), animate: true),
+                      children: [
+                        TextSpan(
+                          text: 'Coin',
+                          style: TextStyle(color: AppColors.green),
                         ),
-                      ),
+                        TextSpan(
+                          text: 'vert',
+                          style: TextStyle(color: AppColors.gold),
+                        ),
+                      ],
                     ),
-                    SizedBox(height: s(14)),
-                    FadeTransition(
-                      opacity: textAnim,
-                      child: SlideTransition(
-                        position: Tween<Offset>(
-                          begin: const Offset(0, 0.25),
-                          end: Offset.zero,
-                        ).animate(textAnim),
-                        child: Column(
-                          children: [
-                            RichText(
-                              text: TextSpan(
-                                style: TextStyle(
-                                  fontSize: s(54),
-                                  fontWeight: FontWeight.w800,
-                                  letterSpacing: -1.6,
-                                  height: 1.0,
-                                ),
-                                children: const [
-                                  TextSpan(
-                                      text: 'COIN', style: TextStyle(color: AppColors.green)),
-                                  TextSpan(
-                                      text: 'VERT', style: TextStyle(color: AppColors.goldDark)),
-                                ],
-                              ),
-                            ),
-                            SizedBox(height: s(12)),
-                            FlankedLabel(
-                              text: 'SMART CURRENCY EXCHANGE',
-                              fontSize: s(12.5),
-                              gap: s(10),
-                              ruleWidth: s(20),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                    SizedBox(height: s(34)),
-                    FadeTransition(
-                      opacity: ctaAnim,
-                      child: SlideTransition(
-                        position: Tween<Offset>(
-                          begin: const Offset(0, 0.4),
-                          end: Offset.zero,
-                        ).animate(ctaAnim),
-                        child: AnimatedBuilder(
-                          animation: _idle,
-                          builder: (context, child) {
-                            final glow = 0.22 + _idle.value * 0.18;
-                            return DecoratedBox(
-                              decoration: BoxDecoration(
-                                borderRadius: BorderRadius.circular(s(16)),
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: AppColors.green.withValues(alpha: glow),
-                                    blurRadius: s(24) + _idle.value * s(10),
-                                    spreadRadius: _idle.value * s(1.5),
-                                  ),
-                                ],
-                              ),
-                              child: child,
-                            );
-                          },
-                          child: GestureDetector(
-                            onTapDown: (_) => setState(() => _pressed = true),
-                            onTapCancel: () => setState(() => _pressed = false),
-                            onTapUp: (_) => setState(() => _pressed = false),
-                            child: AnimatedScale(
-                              scale: _pressed ? 0.96 : 1.0,
-                              duration: const Duration(milliseconds: 110),
-                              curve: Curves.easeOut,
-                              child: TicketButton(
-                                label: 'TAP TO START',
-                                onPressed: controller.startTransaction,
-                                fontSize: s(15),
-                                iconSize: s(19),
-                                paddingH: s(34),
-                                paddingV: s(18),
-                                radius: s(16),
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
+                  ),
+                  const SizedBox(height: AppSpace.sm),
+                  Text(
+                    'Break a bill or build one up, in seconds',
+                    style: AppText.body.copyWith(fontSize: 18),
+                  ),
+                ],
               ),
+            ),
+            const SizedBox(height: AppSpace.xxl),
+            FadeTransition(
+              opacity: cta,
+              child: _StartTarget(onTap: controller.startTransaction),
             ),
           ],
-        );
-      },
+        ),
+      ),
+    );
+  }
+}
+
+/// A single oversized target. Sized well past the touch minimum because this
+/// is the one control a first-time user has to find from a few metres away.
+class _StartTarget extends StatefulWidget {
+  final VoidCallback onTap;
+  const _StartTarget({required this.onTap});
+
+  @override
+  State<_StartTarget> createState() => _StartTargetState();
+}
+
+class _StartTargetState extends State<_StartTarget> {
+  bool _pressed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedScale(
+      scale: _pressed ? 0.97 : 1.0,
+      duration: const Duration(milliseconds: 100),
+      child: Material(
+        color: AppColors.green,
+        borderRadius: BorderRadius.circular(AppRadius.panel),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          // One recognizer. The old build stacked a GestureDetector over an
+          // InkWell, which put two arena members on the same tap — whichever
+          // won was not stable across rebuilds, so the start button could
+          // silently stop responding after a full transaction cycle.
+          onTap: widget.onTap,
+          onHighlightChanged: (v) => setState(() => _pressed = v),
+          child: const Padding(
+            padding: EdgeInsets.symmetric(
+              horizontal: AppSpace.xxl,
+              vertical: AppSpace.lg,
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  'Touch to start',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 26,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: -0.2,
+                  ),
+                ),
+                SizedBox(width: AppSpace.md),
+                Icon(Icons.arrow_forward, color: Colors.white, size: 26),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }

@@ -1,109 +1,104 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
-import '../theme/colors.dart';
 import '../state/kiosk_controller.dart';
-import '../widgets/buttons.dart';
+import '../theme/app_theme.dart';
+import 'buttons.dart';
 
-/// Full-screen error overlay drawn on top of the kiosk frame whenever
-/// KioskController.error is not KioskError.none. Covers hardware
-/// disconnects, jams, AI service outages, and bill rejections — every
-/// path in KioskController._fail() surfaces here.
+/// Overlay for incidents *inside* a transaction — a jam, a hopper fault, a
+/// payout that cannot be assembled.
+///
+/// Standing outages are not shown here; those get their own step, because an
+/// overlay implies a dismissable event and there is nothing the customer can
+/// dismiss about a dead controller board.
+///
+/// Every message ends with what happens to the customer's money. That is the
+/// only question anyone actually has when a cash machine stops mid-way.
 class ErrorOverlay extends StatelessWidget {
   const ErrorOverlay({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final err = context.select<KioskController, KioskError>((c) => c.error);
-    if (err == KioskError.none) return const SizedBox.shrink();
+    final error = context.select<KioskController, KioskError>((c) => c.error);
+    // IgnorePointer, not a bare SizedBox: this sits under a Positioned.fill,
+    // so it is stretched to the whole panel whether or not it draws
+    // anything, and must be explicit about letting touches through.
+    if (error == KioskError.none) {
+      return const IgnorePointer(child: SizedBox.expand());
+    }
 
-    final detail =
-        context.select<KioskController, String?>((c) => c.errorDetail);
     final controller = context.read<KioskController>();
+    final detail = controller.errorDetail;
+    final paid = controller.dispensedSoFar.entries
+        .fold<int>(0, (sum, e) => sum + e.key.value * e.value);
+    final owed = controller.amountInserted - paid;
 
-    return Positioned.fill(
-      child: Container(
-        decoration: BoxDecoration(
-          color: Colors.black.withOpacity(0.85),
-          borderRadius: BorderRadius.circular(20),
-        ),
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(_iconFor(err), size: 40, color: Colors.white),
-            const SizedBox(height: 12),
-            Text(
-              _titleFor(err),
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 20,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-            if (detail != null) ...[
-              const SizedBox(height: 6),
-              Text(
-                detail,
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  color: AppColors.mutedOnDark,
-                  fontSize: 12,
+    return ColoredBox(
+      color: AppColors.ink.withValues(alpha: 0.94),
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 620),
+          child: Padding(
+            padding: const EdgeInsets.all(AppSpace.xl),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(_icon(error), size: 48, color: AppColors.onInk),
+                const SizedBox(height: AppSpace.md),
+                Text(
+                  _title(error),
+                  style: AppText.title.copyWith(color: AppColors.onInk),
                 ),
-              ),
-            ],
-            const SizedBox(height: 16),
-            OutlinedGreenButton(
-              label: uppercaseLabel(_actionLabelFor(err)),
-              onPressed: () => controller.restart(),
+                if (detail != null) ...[
+                  const SizedBox(height: AppSpace.sm),
+                  Text(
+                    detail,
+                    style: AppText.body.copyWith(
+                      color: AppColors.onInkMuted,
+                      fontSize: 17,
+                    ),
+                  ),
+                ],
+                if (owed > 0) ...[
+                  const SizedBox(height: AppSpace.lg),
+                  Container(
+                    padding: const EdgeInsets.all(AppSpace.md),
+                    decoration: BoxDecoration(
+                      color: AppColors.gold,
+                      borderRadius: BorderRadius.circular(AppRadius.control),
+                    ),
+                    child: Text(
+                      'You are still owed ${peso(owed)}. Please show this '
+                      'screen to the attendant — the kiosk has recorded it.',
+                      style: AppText.bodyStrong.copyWith(color: Colors.white),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: AppSpace.xl),
+                PrimaryButton(
+                  label: 'I understand',
+                  onPressed: controller.dismissError,
+                ),
+              ],
             ),
-          ],
+          ),
         ),
       ),
     );
   }
 
-  IconData _iconFor(KioskError err) {
-    switch (err) {
-      case KioskError.hardwareOffline:
-        return Icons.memory;
-      case KioskError.aiOffline:
-        return Icons.smart_toy_outlined;
-      case KioskError.billRejected:
-        return Icons.money_off;
-      case KioskError.jam:
-        return Icons.report_gmailerrorred;
-      case KioskError.dispenseFailed:
-        return Icons.warning_amber_rounded;
-      case KioskError.none:
-        return Icons.check;
-    }
-  }
+  IconData _icon(KioskError error) => switch (error) {
+        KioskError.jam => Icons.warning_amber_rounded,
+        KioskError.dispenseFailed => Icons.error_outline,
+        KioskError.planUnavailable => Icons.help_outline,
+        KioskError.none => Icons.check,
+      };
 
-  String _titleFor(KioskError err) {
-    switch (err) {
-      case KioskError.hardwareOffline:
-        return 'Kiosk temporarily unavailable';
-      case KioskError.aiOffline:
-        return 'Authentication service unavailable';
-      case KioskError.billRejected:
-        return 'Bill could not be verified';
-      case KioskError.jam:
-        return 'Please wait — clearing a jam';
-      case KioskError.dispenseFailed:
-        return 'Dispensing error';
-      case KioskError.none:
-        return '';
-    }
-  }
-
-  String _actionLabelFor(KioskError err) {
-    switch (err) {
-      case KioskError.billRejected:
-        return 'Try again';
-      default:
-        return 'Start over';
-    }
-  }
+  String _title(KioskError error) => switch (error) {
+        KioskError.jam => 'Something is stuck',
+        KioskError.dispenseFailed => 'The payout did not finish',
+        KioskError.planUnavailable => 'We cannot make that amount',
+        KioskError.none => '',
+      };
 }

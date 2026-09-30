@@ -24,31 +24,36 @@ extension ExchangeModeX on ExchangeMode {
       };
 }
 
-/// An incident inside a transaction, shown over the flow.
-enum KioskError { none, jam, dispenseFailed, planUnavailable }
+enum KioskError { none, dispenseFailed, planUnavailable }
 
-/// Why the kiosk is refusing service. Distinct from [KioskError] because
-/// this is a standing condition no customer action can clear.
-enum OutageReason { none, hardware, classifier, stockUnknown }
+enum OutageReason { none, hardware, stockUnknown }
 
-/// A short-lived message shown inline during the insert-cash step — a
-/// rejected note, a note the classifier could not read. Deliberately not an
-/// error overlay: those tear down the transaction, and tearing down a
-/// transaction that already holds the customer's cash is how people lose
-/// money to a machine.
 class InlineNotice {
   final String message;
   final bool isWarning;
   const InlineNotice(this.message, {this.isWarning = true});
 }
 
-/// Escalate a *rejected* note to the admin app for human review when the
-/// classifier was this confident or better — below it, the note is simply
-/// not a banknote and is not worth a reviewer's time.
 const double _flagReviewThreshold = 0.60;
 
-/// Drives the whole transaction. The UI reads from this and calls its
-/// methods; no screen owns transaction state.
+/// Drives the whole transaction against `coinvert_firmware.ino` (Uno +
+/// PCA9685 build). Two things about this specific firmware shape the whole
+/// design here, worth keeping in mind while reading this file:
+///
+/// 1. **The acceptor is hardware-gated via `ACCEPTOR:ON`/`ACCEPTOR:OFF`**,
+///    which drives the acceptor's own enable/inhibit line
+///    (`PIN_BILL_ACCEPTOR_ENABLE` in the .ino) — added specifically so an
+///    unverifiable note can be refused before it's ever fed in, not just
+///    rejected afterward. It is only ever armed while the customer is at
+///    the insert step AND the classifier is online (see [_syncAcceptorGate])
+///    — everywhere else, including the instant the classifier drops offline
+///    mid-transaction, it's disabled.
+/// 2. **The firmware tracks its own running credit** and reports it after
+///    every accepted coin, accepted bill, and completed dispense via
+///    `CREDIT:<pesos>`. Rather than maintain a second, potentially
+///    drifting copy of that number in Dart, [amountInserted] is driven
+///    directly by that line — the firmware is the source of truth for how
+///    much cash physically went in.
 class KioskController extends ChangeNotifier {
   final SerialService serial;
   final AiAuthService aiAuth;
@@ -70,25 +75,27 @@ class KioskController extends ChangeNotifier {
   Timer? _statusTimer;
   bool _disposed = false;
 
-  // ── Public state ──────────────────────────────────────────────────────
   KioskStep step = KioskStep.welcome;
   ExchangeMode mode = ExchangeMode.none;
   KioskError error = KioskError.none;
   String? errorDetail;
   InlineNotice? notice;
-
-  /// True while the idle warning banner is up.
   bool idleWarning = false;
 
+  /// Driven by the firmware's own `CREDIT:` line — see class doc.
   int amountInserted = 0;
+
+  /// The value of a bill currently mid-authentication, from `BILL:VALUE:`.
+  /// Not yet part of [amountInserted] — the firmware only credits it once
+  /// this app answers `BILL:ACCEPT` and the board confirms.
+  int? _pendingBillValue;
+
   int? lastNoteDenomination;
   double? lastNoteConfidence;
 
   bool hardwareConnected = false;
   bool classifierOnline = false;
 
-  /// Plan currently being executed, and what has physically landed in the
-  /// tray so far — the complete screen reports actual units, not intent.
   DispensePlan? activePlan;
   final Map<DispenseSlot, int> dispensedSoFar = {};
 
@@ -97,11 +104,33 @@ class KioskController extends ChangeNotifier {
   bool _payoutWasNotes = false;
   bool _transactionSettled = false;
 
-  // ── Readiness ─────────────────────────────────────────────────────────
+  /// Whether the app WANTS the acceptor armed right now. This does not by
+  /// itself send anything — see [_syncAcceptorGate], which is the only
+  /// place that actually calls enableAcceptor()/disableAcceptor(), so the
+  /// hardware state can't drift out of sync with this by being set from
+  /// two different call sites.
+  bool get _shouldAcceptorBeArmed =>
+      step == KioskStep.insertCash && classifierOnline && hardwareConnected;
 
-  /// Notes can only be taken when the classifier is up. When it is down the
-  /// kiosk stays open for coins rather than shutting entirely — a classifier
-  /// restart shouldn't close a machine that can still do useful work.
+  bool _acceptorArmed = false;
+
+  /// The single point where the acceptor's hardware gate is actually
+  /// changed. Call this after anything that could change
+  /// [_shouldAcceptorBeArmed] — a step transition, a classifier state
+  /// change, a link state change — rather than calling
+  /// enableAcceptor()/disableAcceptor() directly elsewhere.
+  void _syncAcceptorGate() {
+    final want = _shouldAcceptorBeArmed;
+    if (want == _acceptorArmed) return;
+    _acceptorArmed = want;
+    if (want) {
+      serial.enableAcceptor();
+    } else {
+      serial.disableAcceptor();
+    }
+  }
+
+  /// Whether the app will actually act on a bill reaching the acceptor.
   bool get acceptsNotes => classifierOnline;
 
   OutageReason get outage {
@@ -119,11 +148,6 @@ class KioskController extends ChangeNotifier {
     _linkSub = serial.link.listen(_onLinkChange);
     _aiSub = aiAuth.onlineState.listen(_onClassifierChange);
 
-    // Sign in before subscribing to Firestore. Rules require an
-    // authenticated request, and snapshots() does not retry after a
-    // permission-denied on its first frame — subscribing too early is what
-    // used to leave fee config and stock silently dead for the whole
-    // session with nothing surfaced anywhere.
     try {
       await firebase.ensureSignedIn();
     } catch (e) {
@@ -149,6 +173,7 @@ class KioskController extends ChangeNotifier {
     unawaited(firebase.reportStatus(status: canServe ? 'online' : 'fault'));
 
     _applyReadiness();
+    _syncAcceptorGate();
     _refresh();
   }
 
@@ -158,54 +183,53 @@ class KioskController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Moves in and out of the out-of-service step as conditions change.
   void _applyReadiness() {
     if (!canServe) {
-      // Never yank the screen away mid-dispense — let the in-flight
-      // sequence finish or fail on its own terms so the customer sees what
-      // actually happened to their money.
       if (step.isCommitted) return;
       if (step != KioskStep.outOfService) {
         _clearIdleTimer();
         step = KioskStep.outOfService;
+        _syncAcceptorGate();
       }
       return;
     }
     if (step == KioskStep.outOfService) {
       step = KioskStep.welcome;
       _resetTransactionState();
+      _syncAcceptorGate();
     }
   }
 
   void _onLinkChange(LinkState state) {
     hardwareConnected = state == LinkState.connected;
+    if (!hardwareConnected) {
+      // The link just dropped — _acceptorArmed can't be trusted to still
+      // reflect reality on the board (it may have reset), so force a
+      // resync attempt regardless of the memoised want/armed comparison.
+      _acceptorArmed = false;
+    }
     if (!hardwareConnected && !step.isCommitted) {
       unawaited(firebase.logError(const KioskErrorRecord(
         code: 'hardware_offline',
         message: 'Serial link to the controller board dropped',
       )));
     }
+    _syncAcceptorGate();
     _refresh();
   }
 
   void _onClassifierChange(bool online) {
     classifierOnline = online;
-    // Stop taking notes we cannot verify, rather than escrowing one and
-    // discovering the classifier is gone with the customer's money inside.
-    //
-    // Only ever *arm* the acceptors while the customer is actually at the
-    // insert step. Enabling them on a classifier recovery that happened to
-    // land while the kiosk sat on its welcome screen would leave a live
-    // note slot on an idle machine.
-    if (online) {
-      if (step == KioskStep.insertCash) serial.enableAcceptors();
-    } else {
-      serial.disableAcceptors();
+    if (!online) {
       unawaited(firebase.logError(const KioskErrorRecord(
         code: 'classifier_offline',
-        message: 'Banknote classifier stopped responding; notes disabled',
+        message:
+            'Banknote classifier stopped responding; bills will be mechanically '
+            'accepted by the acceptor but auto-rejected before being credited, '
+            'since this firmware has no acceptor-gating command.',
       )));
     }
+    _syncAcceptorGate();
     _refresh();
   }
 
@@ -213,62 +237,125 @@ class KioskController extends ChangeNotifier {
 
   void _onArduinoEvent(ArduinoEvent event) {
     switch (event.type) {
+      case 'READY':
+        // Board just booted/reset. Nothing to do beyond noting it arrived —
+        // link state is already tracked separately via LinkState.
+        break;
+
+      case 'BILL':
+        _onBillEvent(event);
+
       case 'COIN':
-        _onCoinAccepted(event.intArg(0));
-      case 'BILL_STAGED':
-        unawaited(_authenticateStagedNote());
-      case 'BILL_REJECTED':
-        _showNotice('That note was not accepted. Try another one.');
-      case 'DISPENSE_JAM':
-      case 'SENSOR_JAM':
-        _raiseError(KioskError.jam, 'Jam reported: ${event.args.join(' ')}');
-      case 'ERROR':
-        unawaited(firebase.logError(KioskErrorRecord(
-          code: 'firmware_${event.arg(0).toLowerCase()}',
-          message: event.arg(1).isEmpty ? event.toString() : event.arg(1),
-        )));
+        _onCoinEvent(event);
+
+      case 'CREDIT':
+        // Firmware's own running total — see class doc. This is the only
+        // place amountInserted is ever set for money already inside the
+        // machine.
+        amountInserted = event.intArg(0);
+
+      case 'DISPENSE':
+        // Ack routing for an in-flight dispense is handled inside
+        // SerialService itself (it resolves the pending Future). Nothing
+        // additional needed here beyond letting the event flow through for
+        // any future logging.
+        break;
+
+      case 'UNKNOWN':
+        // The firmware echoes back anything it didn't recognise — useful
+        // for catching a stale command from an old build, logged but not
+        // fatal.
+        debugPrint('[arduino] firmware did not recognise: ${event.args.join(':')}');
+
       default:
-        // DISPENSE_DONE and friends are consumed by SerialService's ack
-        // tracking. Anything else is ignored rather than fatal, so newer
-        // firmware can add messages without breaking older app builds.
         break;
     }
     notifyListeners();
   }
 
-  void _onCoinAccepted(int value) {
-    if (value <= 0) return;
-    if (step != KioskStep.insertCash) return;
-    if (amountInserted + value > ChangePlanner.maxPayout) {
-      _showNotice('That is over the per-transaction limit.');
-      return;
+  void _onBillEvent(ArduinoEvent event) {
+    final sub = event.arg(0).toUpperCase();
+    switch (sub) {
+      case 'VALUE':
+        _pendingBillValue = event.intArg(1);
+
+      case 'READY_UV':
+        // This is the app's one and only window to act: the firmware runs
+        // its own fixed-timer sequence from here (UV hold → visible hold →
+        // an 8s verdict wait) and will default to reject if this app never
+        // answers. Kick off authentication now rather than waiting for
+        // READY_VISIBLE — that leaves the most possible margin against the
+        // firmware's own timeout.
+        unawaited(_authenticatePendingBill());
+
+      case 'READY_VISIBLE':
+        // Visible-light stage started. Nothing to do — this build's
+        // classifier contract authenticates from a single UV-lit capture;
+        // see AiAuthService's doc if that ever changes to want a second
+        // image from this stage.
+        break;
+
+      case 'DONE':
+        final verdict = event.arg(1).toUpperCase();
+        if (verdict == 'ACCEPT') {
+          _hadNoteInput = true;
+          notice = InlineNotice(
+            '${lastNoteDenomination != null ? peso_(lastNoteDenomination!) : 'Note'} accepted',
+            isWarning: false,
+          );
+        } else {
+          notice = const InlineNotice(
+            'That note was not accepted. It has been returned.',
+          );
+        }
+        _pendingBillValue = null;
+        if (step == KioskStep.authenticating) step = KioskStep.insertCash;
+        _syncAcceptorGate();
+        _kickIdleTimer();
     }
-    amountInserted += value;
-    _hadCoinInput = true;
-    _kickIdleTimer();
-    notifyListeners();
   }
 
-  Future<void> _authenticateStagedNote() async {
+  void _onCoinEvent(ArduinoEvent event) {
+    if (event.arg(0).toUpperCase() != 'VALUE') return;
+    if (step != KioskStep.insertCash) return;
+    _hadCoinInput = true;
+    _kickIdleTimer();
+    // amountInserted itself is updated by the CREDIT: line that follows
+    // this immediately in the firmware — nothing to add here.
+  }
+
+  Future<void> _authenticatePendingBill() async {
     if (step != KioskStep.insertCash) return;
 
     step = KioskStep.authenticating;
     notice = null;
+    _syncAcceptorGate();
     notifyListeners();
 
-    serial.uvOn();
-    final result = await aiAuth.authenticate();
-    serial.captureAck();
-    serial.uvOff();
-
-    // A service outage is not a counterfeit. Return the note and say so
-    // plainly, keeping everything already inserted.
-    if (result.isServiceError) {
-      serial.returnEscrow();
-      classifierOnline = false;
-      serial.disableAcceptors();
-      _showNotice('Note checking is unavailable. Coins only for now.');
+    if (!classifierOnline) {
+      // Can't verify it — see class doc point 1. Reject before it's ever
+      // credited rather than accept something unverified.
+      serial.rejectBill();
+      _pendingBillValue = null;
       step = KioskStep.insertCash;
+      _syncAcceptorGate();
+      _showNotice('Note checking is offline, so notes can\'t be accepted '
+          'right now. Coins only, sorry.');
+      _refresh();
+      return;
+    }
+
+    final result = await aiAuth.authenticate();
+
+    if (result.isServiceError) {
+      // A service outage is not a counterfeit determination — the bill
+      // still can't be credited, but say why plainly.
+      serial.rejectBill();
+      classifierOnline = false;
+      _pendingBillValue = null;
+      step = KioskStep.insertCash;
+      _syncAcceptorGate();
+      _showNotice('Note checking is unavailable. Coins only for now.');
       unawaited(firebase.logError(KioskErrorRecord(
         code: 'classifier_error',
         message: result.errorMessage ?? 'unknown classifier error',
@@ -277,22 +364,27 @@ class KioskController extends ChangeNotifier {
       return;
     }
 
+    final claimed = _pendingBillValue;
     final denomination = result.denomination;
 
-    if (result.authentic && denomination != null && denomination > 0) {
+    if (result.authentic &&
+        denomination != null &&
+        denomination > 0 &&
+        claimed != null &&
+        // The classifier's read must agree with what the acceptor's own
+        // pulse count claimed. A mismatch here — genuine note but a
+        // different denomination than the acceptor thinks — is treated as
+        // a reason to reject rather than trust either signal alone.
+        denomination == claimed) {
       if (amountInserted + denomination > ChangePlanner.maxPayout) {
-        serial.returnEscrow();
+        serial.rejectBill();
         _showNotice('That would go over the per-transaction limit.');
       } else {
-        serial.acceptBill();
-        amountInserted += denomination;
         lastNoteDenomination = denomination;
         lastNoteConfidence = result.confidence;
-        _hadNoteInput = true;
-        notice = InlineNotice(
-          '${peso_(denomination)} accepted',
-          isWarning: false,
-        );
+        serial.acceptBill();
+        // amountInserted updates once the firmware's own CREDIT: line
+        // follows BILL:DONE:ACCEPT — not set directly here.
       }
     } else {
       serial.rejectBill();
@@ -302,37 +394,26 @@ class KioskController extends ChangeNotifier {
           denomination: denomination,
           confidence: result.confidence,
         )));
-        _showNotice('We could not verify that note. It has been returned.');
-      } else {
-        _showNotice('That note was not recognised. It has been returned.');
       }
     }
 
-    step = KioskStep.insertCash;
+    // Step transition and any acceptance/rejection notice both happen once
+    // BILL:DONE:<verdict> actually arrives (see _onBillEvent) — that's the
+    // firmware confirming the sort motion ran, not just that this app made
+    // a decision.
     _kickIdleTimer();
-    notifyListeners();
   }
 
-  // ── Money maths ───────────────────────────────────────────────────────
+  // ── Money maths (unchanged from the value-based design) ───────────────
 
-  /// Service fee in whole pesos.
-  ///
-  /// Floored, not rounded. Rounding up could take a peso the customer never
-  /// agreed to; flooring also means small transactions land on a ₱0 fee
-  /// naturally, with no separate exemption rule to keep in sync.
   int get rawFee {
     if (!firebase.feeEnabled || firebase.feePercent <= 0) return 0;
     final fee = amountInserted * firebase.feePercent / 100;
     return fee.floor().clamp(0, amountInserted);
   }
 
-  /// What the customer is owed before checking it can physically be paid.
   int get grossPayout => amountInserted - rawFee;
 
-  /// The plan the kiosk will actually execute, given live stock and the
-  /// chosen mode. Computed on demand and cached per input state — never
-  /// inside a build method, because planning touches inventory and used to
-  /// write to Firestore on every rebuild.
   DispensePlan get proposedPlan {
     final cacheKey = '$amountInserted|${mode.name}|${firebase.feePercent}';
     if (_planCacheKey == cacheKey && _planCache != null) return _planCache!;
@@ -350,26 +431,16 @@ class KioskController extends ChangeNotifier {
   String? _planCacheKey;
   DispensePlan? _planCache;
 
-  /// Value the kiosk can actually hand back right now.
   int get payableAmount => proposedPlan.dispensed;
-
-  /// Fee actually charged. If stock cannot make the exact gross payout, the
-  /// difference is absorbed into the fee rather than shorting the customer
-  /// without saying so — and [hasShortfall] makes the UI disclose it before
-  /// they commit.
   int get effectiveFee => amountInserted - payableAmount;
-
   bool get hasShortfall => proposedPlan.shortfall > 0;
 
-  /// Minimum to proceed. Pabarya breaks cash into smaller pieces, so there
-  /// has to be something worth breaking; pabuo has no floor.
   bool get meetsMinimum {
     if (amountInserted <= 0) return false;
     if (mode == ExchangeMode.pabarya) return amountInserted >= 20;
     return true;
   }
 
-  /// Guard for the confirm button: the kiosk must be able to pay something.
   bool get canConfirmPayout => payableAmount > 0 && proposedPlan.isExact;
 
   TxType get _txType {
@@ -395,28 +466,20 @@ class KioskController extends ChangeNotifier {
     mode = selected;
     step = KioskStep.insertCash;
     _invalidatePlan();
-    if (acceptsNotes) {
-      serial.enableAcceptors();
-    } else {
-      serial.disableAcceptors();
-    }
+    _syncAcceptorGate();
     _kickIdleTimer();
     notifyListeners();
   }
 
   void doneInserting() {
     if (!meetsMinimum) return;
-    serial.disableAcceptors();
     step = KioskStep.selectOutput;
     _invalidatePlan();
+    _syncAcceptorGate();
     _kickIdleTimer();
     notifyListeners();
   }
 
-  /// Confirms a payout mix and runs it.
-  ///
-  /// [plan] must be exact. A short plan is refused outright rather than
-  /// dispensed with an alert filed somewhere the customer will never see.
   Future<void> confirmPayout(DispensePlan plan) async {
     if (step != KioskStep.selectOutput) return;
     if (plan.isEmpty || !plan.isExact) {
@@ -429,48 +492,53 @@ class KioskController extends ChangeNotifier {
     await _runDispense(plan);
   }
 
-  /// Steps through the hoppers one denomination at a time, waiting for each
-  /// to confirm before starting the next.
-  ///
-  /// The previous version wrote every DISPENSE command in a loop and then
-  /// treated the first DISPENSE_DONE as the whole payout finishing — so the
-  /// transaction was logged as complete, and the customer told to collect
-  /// their cash, while the remaining hoppers were still running.
+  /// Sequences dispensing one denomination at a time, same principle as
+  /// before, translated to this firmware's lane addressing. Largest value
+  /// first, so a failure partway through leaves the customer already
+  /// holding most of what they're owed.
   Future<void> _runDispense(DispensePlan plan) async {
     _clearIdleTimer();
     step = KioskStep.dispensing;
+    _syncAcceptorGate();
     activePlan = plan;
     dispensedSoFar.clear();
     _payoutWasNotes = plan.units.keys.every((s) => s.isBill);
     _transactionSettled = false;
     notifyListeners();
 
-    // Largest first: if something fails partway, the customer has already
-    // received most of what they are owed, which makes the manual
-    // reconciliation far smaller.
     final ordered = plan.units.entries.toList()
       ..sort((a, b) => b.key.value.compareTo(a.key.value));
 
     for (final entry in ordered) {
+      final slot = entry.key;
+      final lane = slot.isBill
+          ? DenominationLanes.billLane(slot.value)
+          : DenominationLanes.coinLane(slot.value);
+
+      if (lane < 0) {
+        // The app's denomination list and the firmware's lane arrays have
+        // drifted out of sync — see docs/HARDWARE.md. This must never
+        // silently skip the payout.
+        await _settleDispense(
+          status: 'error',
+          failureMessage:
+              '${slot.label} has no matching lane on this board. The app '
+              'and firmware denomination lists are out of sync.',
+        );
+        return;
+      }
+
       try {
-        final moved = await serial.dispense(
-          value: entry.key.value,
-          isBill: entry.key.isBill,
+        final moved = await serial.dispenseAtLane(
+          lane: lane,
+          isBill: slot.isBill,
           count: entry.value,
         );
-        dispensedSoFar[entry.key] = moved;
+        dispensedSoFar[slot] = moved;
         notifyListeners();
-
-        if (moved < entry.value) {
-          await _settleDispense(
-            status: 'error',
-            failureMessage:
-                'The ${entry.key.label} hopper released $moved of ${entry.value}.',
-          );
-          return;
-        }
       } on DispenseException catch (e) {
-        if (e.dispensed > 0) dispensedSoFar[entry.key] = e.dispensed;
+        // This firmware has no partial-progress reporting — a failure here
+        // means nothing on this lane was confirmed at all this round.
         await _settleDispense(status: 'error', failureMessage: e.message);
         return;
       } catch (e) {
@@ -482,8 +550,6 @@ class KioskController extends ChangeNotifier {
     await _settleDispense(status: 'completed');
   }
 
-  /// Writes inventory and the transaction record exactly once, from what
-  /// physically moved rather than what was planned.
   Future<void> _settleDispense({
     required String status,
     String? failureMessage,
@@ -517,21 +583,21 @@ class KioskController extends ChangeNotifier {
     } else {
       step = KioskStep.complete;
     }
+    _syncAcceptorGate();
     notifyListeners();
   }
 
-  /// Cancel. Only meaningful before any cash has been taken.
-  ///
-  /// Once notes and coins are inside, there is nothing honest to cancel to:
-  /// accepted cash has already left escrow and cannot be handed back as the
-  /// same pieces. Rather than pretending otherwise, the kiosk moves the
-  /// customer to choosing a payout so they leave with their money.
+  /// Cancel. Only meaningful before any cash has been taken — see the note
+  /// on this in the value-based design; unchanged here. Once cash is in,
+  /// the firmware's own credit is already non-zero and there's no honest
+  /// "give back exactly what was inserted," so the customer is moved to
+  /// choosing a payout instead.
   void cancelTransaction() {
     if (step.isCommitted) return;
 
     if (amountInserted > 0) {
-      serial.disableAcceptors();
       step = KioskStep.selectOutput;
+      _syncAcceptorGate();
       _showNotice(
         'Cash already inserted cannot be returned as-is. '
         'Choose how you would like it back.',
@@ -541,24 +607,20 @@ class KioskController extends ChangeNotifier {
       return;
     }
 
-    serial.disableAcceptors();
-    serial.returnEscrow();
     _resetToWelcome();
   }
 
   void dismissError() {
     error = KioskError.none;
     errorDetail = null;
-    // A failed dispense leaves the machine in a state only an attendant can
-    // reconcile, so it goes to the completion summary rather than pretending
-    // the transaction can restart.
     step = amountInserted > 0 ? KioskStep.complete : KioskStep.welcome;
+    _syncAcceptorGate();
     notifyListeners();
   }
 
   void restart() => _resetToWelcome();
 
-  // ── Idle watchdog ─────────────────────────────────────────────────────
+  // ── Idle watchdog (unchanged) ─────────────────────────────────────────
 
   void _kickIdleTimer() {
     idleWarning = false;
@@ -580,10 +642,6 @@ class KioskController extends ChangeNotifier {
     _idleTimer = Timer(AppConfig.idleGrace, _onIdleExpired);
   }
 
-  /// Someone walked away. If they left money in the machine, pay it out
-  /// rather than resetting and keeping it — an unattended kiosk that
-  /// silently absorbs abandoned cash is both a support nightmare and, at
-  /// scale, indistinguishable from theft.
   void _onIdleExpired() {
     idleWarning = false;
     if (amountInserted > 0) {
@@ -606,7 +664,6 @@ class KioskController extends ChangeNotifier {
     _resetToWelcome();
   }
 
-  /// Any touch anywhere restarts the countdown.
   void registerInteraction() {
     if (!step.isTransactional) return;
     if (idleWarning) {
@@ -641,9 +698,13 @@ class KioskController extends ChangeNotifier {
 
   void _resetTransactionState() {
     mode = ExchangeMode.none;
-    amountInserted = 0;
+    // amountInserted is NOT reset to 0 here directly — it reflects the
+    // firmware's own credit, which only the firmware changes. A fresh
+    // transaction genuinely starting at zero relies on the firmware having
+    // already zeroed its credit after the previous payout completed.
     lastNoteDenomination = null;
     lastNoteConfidence = null;
+    _pendingBillValue = null;
     _hadCoinInput = false;
     _hadNoteInput = false;
     _payoutWasNotes = false;
@@ -658,9 +719,9 @@ class KioskController extends ChangeNotifier {
 
   void _resetToWelcome() {
     _clearIdleTimer();
-    serial.disableAcceptors();
     _resetTransactionState();
     step = canServe ? KioskStep.welcome : KioskStep.outOfService;
+    _syncAcceptorGate();
     notifyListeners();
   }
 
@@ -680,6 +741,4 @@ class KioskController extends ChangeNotifier {
   }
 }
 
-/// Local peso formatter — kept here so the controller has no dependency on
-/// the theme layer.
 String peso_(int amount) => '₱$amount';

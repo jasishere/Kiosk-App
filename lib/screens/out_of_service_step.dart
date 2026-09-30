@@ -15,7 +15,8 @@ class OutOfServiceStep extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final reason = context.select<KioskController, OutageReason>((c) => c.outage);
+    final reason =
+        context.select<KioskController, OutageReason>((c) => c.outage);
 
     return Center(
       child: ConstrainedBox(
@@ -63,7 +64,6 @@ class OutOfServiceStep extends StatelessWidget {
 
   String _detail(OutageReason reason) => switch (reason) {
         OutageReason.hardware => 'Reference: cash handling controller offline',
-        OutageReason.classifier => 'Reference: note checking offline',
         OutageReason.stockUnknown => 'Reference: cash levels unavailable',
         OutageReason.none => 'Reference: starting up',
       };

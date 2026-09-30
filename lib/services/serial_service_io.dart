@@ -10,59 +10,54 @@ import 'arduino_protocol.dart';
 
 export 'arduino_protocol.dart';
 
-/// USB serial link to the Arduino Mega.
+/// USB serial link to the Uno running `coinvert_firmware.ino`.
 ///
-/// Three things this does that the previous version did not, all of which
-/// were load-bearing for an unattended machine:
+/// This firmware talks at **9600 baud** (`Serial.begin(9600)` in the .ino),
+/// not 115200 — that's not a typo carried over from an earlier draft, it's
+/// what this specific sketch actually opens the port at. If you change the
+/// firmware's baud rate, change [baudRate]'s default here to match, or the
+/// link will just produce garbled bytes with no clear error.
 ///
-///  1. **Reconnects.** A USB re-enumeration (brownout, someone knocking the
-///     cable) used to take the kiosk down until a human rebooted it. It now
-///     retries on a timer and comes back on its own.
-///  2. **Latches the link state.** The heartbeat watchdog used to re-emit
-///     `false` once a second forever once the link went quiet. Every one of
-///     those reached the controller, which logged an alert to Firestore —
-///     an overnight fault would have written tens of thousands of alert
-///     documents. State changes are now emitted on transition only.
-///  3. **Tracks command acks.** [dispense] returns a Future that completes
-///     when the Arduino confirms that specific hopper finished, or throws on
-///     timeout. Fire-and-forget dispensing is how you end up marking a
-///     transaction complete while notes are still moving.
+/// **This firmware has no confirmed-dispense count.** `dispense()` below
+/// resolves as soon as a `DONE` line for the right lane arrives — that only
+/// means the servo motion finished, not that a sensor verified units
+/// actually left the compartment. Treat every successful `dispense()` result
+/// as "commanded and the servo completed," not as "verified delivered."
+/// [DispenseException] is still raised on a genuine timeout (no `DONE` at
+/// all, e.g. the board hung or a wire came loose) — that part hasn't
+/// changed — but there's no code path today where the firmware reports a
+/// *partial* failure, because it doesn't have the sensor to notice one.
 class SerialService {
   final String portName;
   final int baudRate;
 
   SerialService({
     this.portName = AppConfig.serialPort,
-    this.baudRate = AppConfig.serialBaud,
+    this.baudRate = 9600,
   });
 
   SerialPort? _port;
   SerialPortReader? _reader;
   StreamSubscription<Uint8List>? _sub;
-  Timer? _watchdog;
   Timer? _reconnect;
+  Timer? _pingWatchdog;
 
   final _events = StreamController<ArduinoEvent>.broadcast();
   final _link = StreamController<LinkState>.broadcast();
 
   String _buffer = '';
-  DateTime _lastHeartbeat = DateTime.fromMillisecondsSinceEpoch(0);
   LinkState _state = LinkState.disconnected;
   bool _disposed = false;
+  DateTime _lastTraffic = DateTime.fromMillisecondsSinceEpoch(0);
 
-  /// Outstanding dispense command awaiting its DISPENSE_DONE.
+  /// Outstanding dispense command awaiting its DONE line.
   _PendingDispense? _pending;
 
   Stream<ArduinoEvent> get events => _events.stream;
-
-  /// Emits only on genuine transitions — never repeats the current state.
   Stream<LinkState> get link => _link.stream;
-
   LinkState get state => _state;
   bool get isConnected => _state == LinkState.connected;
 
-  /// Opens the port and starts the watchdog. Safe to call repeatedly; it is
-  /// also what the reconnect timer calls.
   bool connect() {
     if (_disposed) return false;
     if (_port?.isOpen ?? false) return true;
@@ -93,10 +88,9 @@ class SerialService {
         onDone: _dropLink,
       );
 
-      _lastHeartbeat = DateTime.now();
+      _lastTraffic = DateTime.now();
       _setState(LinkState.connected);
-      _startWatchdog();
-      send(ArduinoCommand.reset);
+      _startPingWatchdog();
       return true;
     } catch (e) {
       debugPrint('[serial] open failed on $portName: $e');
@@ -113,10 +107,6 @@ class SerialService {
 
   void _onData(Uint8List chunk) {
     _buffer += utf8.decode(chunk, allowMalformed: true);
-
-    // Guard against a wedged device streaming bytes with no newline — an
-    // unbounded buffer here is a slow memory leak on a machine expected to
-    // run for months.
     if (_buffer.length > 8192) _buffer = _buffer.substring(_buffer.length - 1024);
 
     var idx = _buffer.indexOf('\n');
@@ -129,56 +119,59 @@ class SerialService {
   }
 
   void _handleLine(String line) {
-    final event = ArduinoEvent.parse(line);
-
-    // Any traffic at all proves the board is alive, not just HEARTBEAT —
-    // a busy dispense cycle can legitimately delay the heartbeat.
-    _lastHeartbeat = DateTime.now();
+    _lastTraffic = DateTime.now();
     if (_state == LinkState.stale) _setState(LinkState.connected);
 
-    if (event.type == 'HEARTBEAT') return;
+    final event = ArduinoEvent.parse(line);
 
-    if (event.type == 'DISPENSE_DONE' || event.type == 'DISPENSE_FAILED') {
+    // This firmware has no heartbeat message — READY is sent once at boot,
+    // and PONG only on request. Liveness is inferred from *any* traffic
+    // (see _startPingWatchdog), not a dedicated heartbeat line.
+    if (event.type == 'DISPENSE') {
       _resolvePending(event);
     }
     _events.add(event);
   }
 
   void _resolvePending(ArduinoEvent event) {
+    // Wire shape: DISPENSE:<COIN|BILL>:DONE:<lane>
+    // event.type == 'DISPENSE', args == [<COIN|BILL>, 'DONE', <lane>]
+    if (event.args.length < 3) return;
+    if (event.arg(1).toUpperCase() != 'DONE') return;
+
     final pending = _pending;
     if (pending == null) return;
 
-    // Match on the echoed descriptor so a stale ack from a previous,
-    // timed-out command can't complete the one currently in flight.
     final isBill = event.arg(0).toUpperCase() == 'BILL';
-    final value = event.intArg(1);
-    if (isBill != pending.isBill || value != pending.value) return;
+    final lane = int.tryParse(event.arg(2)) ?? -1;
+    if (isBill != pending.isBill || lane != pending.lane) return;
 
     _pending = null;
     pending.timer.cancel();
-    if (pending.completer.isCompleted) return;
-
-    if (event.type == 'DISPENSE_FAILED') {
-      pending.completer.completeError(
-        DispenseException(
-          'Hopper reported a fault dispensing ₱$value',
-          dispensed: event.intArg(2),
-        ),
-      );
-    } else {
-      pending.completer.complete(event.intArg(2));
+    if (!pending.completer.isCompleted) {
+      // No confirmed-count field exists — resolve with the count that was
+      // requested. See the class doc: this is "commanded," not "verified."
+      pending.completer.complete(pending.requestedCount);
     }
   }
 
-  void _startWatchdog() {
-    _watchdog?.cancel();
-    _watchdog = Timer.periodic(const Duration(seconds: 1), (_) {
+  /// This firmware sends no periodic heartbeat, so liveness is judged by
+  /// "did anything at all arrive recently" and topped up with an explicit
+  /// PING when it's been quiet — rather than assuming silence means death,
+  /// which would false-trigger during a long dispense sequence where the
+  /// board is busy running servos and not chatting.
+  void _startPingWatchdog() {
+    _pingWatchdog?.cancel();
+    _pingWatchdog = Timer.periodic(const Duration(seconds: 2), (_) {
       if (_state != LinkState.connected) return;
-      if (DateTime.now().difference(_lastHeartbeat) >
-          AppConfig.heartbeatTimeout) {
-        // Transition once. The old version re-emitted every tick.
-        _setState(LinkState.stale);
-        _dropLink();
+      final quiet = DateTime.now().difference(_lastTraffic);
+      if (quiet > AppConfig.heartbeatTimeout) {
+        send(ArduinoCommand.ping);
+        // One missed PING beyond a further grace period means genuinely gone.
+        if (quiet > AppConfig.heartbeatTimeout * 2) {
+          _setState(LinkState.stale);
+          _dropLink();
+        }
       }
     });
   }
@@ -190,12 +183,9 @@ class SerialService {
     try {
       _port?.close();
       _port?.dispose();
-    } catch (_) {
-      // Port may already be gone — nothing useful to do.
-    }
+    } catch (_) {}
     _port = null;
 
-    // Fail anything in flight rather than leaving the UI on a spinner.
     final pending = _pending;
     _pending = null;
     pending?.timer.cancel();
@@ -215,7 +205,6 @@ class SerialService {
     _reconnect = Timer(AppConfig.reconnectInterval, connect);
   }
 
-  /// Writes a raw command line. Returns false if the port isn't open.
   bool send(String command) {
     final port = _port;
     if (port == null || !port.isOpen) return false;
@@ -229,15 +218,14 @@ class SerialService {
     }
   }
 
-  /// Dispenses [count] units of one denomination and waits for the hopper to
-  /// confirm. Completes with the number of units the Arduino reports it
-  /// actually moved, or throws [DispenseException] on fault or timeout.
+  /// Dispenses [count] units of the coin or bill at lane [lane].
   ///
-  /// One command in flight at a time by design: hoppers share a power rail,
-  /// and running several at once both browns out the rail and makes a
-  /// partial failure impossible to attribute to a denomination.
-  Future<int> dispense({
-    required int value,
+  /// Completes with [count] once the firmware reports that lane's servo
+  /// sequence finished — again, that is not a verified count, see the class
+  /// doc. Throws [DispenseException] if no `DONE` arrives within the
+  /// timeout budget, or if the link drops mid-sequence.
+  Future<int> dispenseAtLane({
+    required int lane,
     required bool isBill,
     required int count,
   }) {
@@ -251,12 +239,17 @@ class SerialService {
     }
 
     final completer = Completer<int>();
+    // This firmware runs each unit's servo motion sequentially with fixed
+    // delays (see BILL_SETTLE_MS / ROLLER_RUN_MS / COIN_SETTLE_MS in the
+    // .ino) — the per-unit budget here must stay comfortably above the sum
+    // of those, or the app will give up before the board finishes.
     final budget = AppConfig.dispenseBaseTimeout +
         AppConfig.dispensePerUnit * count;
 
     final pending = _PendingDispense(
-      value: value,
+      lane: lane,
       isBill: isBill,
+      requestedCount: count,
       completer: completer,
       timer: Timer(budget, () {
         final p = _pending;
@@ -265,8 +258,8 @@ class SerialService {
         if (!completer.isCompleted) {
           completer.completeError(
             DispenseException(
-              'No confirmation from the ₱$value ${isBill ? 'note' : 'coin'} '
-              'hopper within ${budget.inSeconds}s',
+              'No confirmation from ${isBill ? 'bill' : 'coin'} lane $lane '
+              'within ${budget.inSeconds}s',
             ),
           );
         }
@@ -274,7 +267,11 @@ class SerialService {
     );
     _pending = pending;
 
-    if (!send(ArduinoCommand.dispense(value, isBill, count))) {
+    final command = isBill
+        ? ArduinoCommand.dispenseBill(lane, count)
+        : ArduinoCommand.dispenseCoin(lane, count);
+
+    if (!send(command)) {
       _pending = null;
       pending.timer.cancel();
       return Future.error(
@@ -284,20 +281,20 @@ class SerialService {
     return completer.future;
   }
 
-  // Convenience wrappers — see docs/HARDWARE.md for the full table.
-  void reset() => send(ArduinoCommand.reset);
-  void uvOn() => send(ArduinoCommand.uvOn);
-  void uvOff() => send(ArduinoCommand.uvOff);
-  void captureAck() => send(ArduinoCommand.captureAck);
-  void acceptBill() => send(ArduinoCommand.acceptBill);
-  void rejectBill() => send(ArduinoCommand.rejectBill);
-  void returnEscrow() => send(ArduinoCommand.returnEscrow);
-  void enableAcceptors() => send(ArduinoCommand.acceptorEnable);
-  void disableAcceptors() => send(ArduinoCommand.acceptorDisable);
+  void acceptBill() => send(ArduinoCommand.billAccept);
+  void rejectBill() => send(ArduinoCommand.billReject);
+  void requestStatus() => send(ArduinoCommand.status);
+
+  /// Gates the bill acceptor's own enable/inhibit line — see
+  /// PIN_BILL_ACCEPTOR_ENABLE in the .ino. This is what makes it possible to
+  /// actually refuse bills at the hardware level, rather than only being
+  /// able to reject one after it's already been fed through and scanned.
+  void enableAcceptor() => send(ArduinoCommand.acceptorOn);
+  void disableAcceptor() => send(ArduinoCommand.acceptorOff);
 
   Future<void> dispose() async {
     _disposed = true;
-    _watchdog?.cancel();
+    _pingWatchdog?.cancel();
     _reconnect?.cancel();
     _pending?.timer.cancel();
     await _sub?.cancel();
@@ -311,22 +308,25 @@ class SerialService {
 }
 
 class _PendingDispense {
-  final int value;
+  final int lane;
   final bool isBill;
+  final int requestedCount;
   final Completer<int> completer;
   final Timer timer;
 
   _PendingDispense({
-    required this.value,
+    required this.lane,
     required this.isBill,
+    required this.requestedCount,
     required this.completer,
     required this.timer,
   });
 }
 
-/// Raised when a dispense cannot be confirmed. [dispensed] is how many units
-/// the hardware believes it released before failing — the controller needs
-/// it to reconcile inventory and to tell the customer what is in the tray.
+/// Raised when a dispense cannot be confirmed at all (link loss, timeout).
+/// [dispensed] is always 0 here — this firmware has no partial-progress
+/// reporting, so there's nothing more specific to report than "it didn't
+/// finish."
 class DispenseException implements Exception {
   final String message;
   final int dispensed;

@@ -5,8 +5,8 @@ import '../state/kiosk_controller.dart';
 import '../theme/app_theme.dart';
 import 'buttons.dart';
 
-/// Overlay for incidents *inside* a transaction — a jam, a hopper fault, a
-/// payout that cannot be assembled.
+/// Overlay for incidents *inside* a transaction — a payout that did not
+/// finish, or an amount that cannot be assembled.
 ///
 /// Standing outages are not shown here; those get their own step, because an
 /// overlay implies a dismissable event and there is nothing the customer can
@@ -89,14 +89,12 @@ class ErrorOverlay extends StatelessWidget {
   }
 
   IconData _icon(KioskError error) => switch (error) {
-        KioskError.jam => Icons.warning_amber_rounded,
         KioskError.dispenseFailed => Icons.error_outline,
         KioskError.planUnavailable => Icons.help_outline,
         KioskError.none => Icons.check,
       };
 
   String _title(KioskError error) => switch (error) {
-        KioskError.jam => 'Something is stuck',
         KioskError.dispenseFailed => 'The payout did not finish',
         KioskError.planUnavailable => 'We cannot make that amount',
         KioskError.none => '',

@@ -5,20 +5,15 @@ import 'arduino_protocol.dart';
 
 export 'arduino_protocol.dart';
 
-/// Web build of [SerialService].
-///
-/// USB serial is not reachable from a browser, so this exists purely so the
-/// project still analyses and builds for web tooling. It reports the link as
-/// permanently disconnected, which puts the kiosk on its out-of-service
-/// screen — the honest outcome, since a web build genuinely cannot run a
-/// kiosk. The production target is Linux on the Raspberry Pi.
+/// Web build stand-in. Browsers can't do USB serial, so this always reports
+/// disconnected — the honest outcome, since a web build can't run a kiosk.
 class SerialService {
   final String portName;
   final int baudRate;
 
   SerialService({
     this.portName = AppConfig.serialPort,
-    this.baudRate = AppConfig.serialBaud,
+    this.baudRate = 9600,
   });
 
   final _events = StreamController<ArduinoEvent>.broadcast();
@@ -37,8 +32,8 @@ class SerialService {
 
   bool send(String command) => false;
 
-  Future<int> dispense({
-    required int value,
+  Future<int> dispenseAtLane({
+    required int lane,
     required bool isBill,
     required int count,
   }) =>
@@ -46,15 +41,11 @@ class SerialService {
         const DispenseException('Serial hardware is unavailable on web'),
       );
 
-  void reset() {}
-  void uvOn() {}
-  void uvOff() {}
-  void captureAck() {}
   void acceptBill() {}
   void rejectBill() {}
-  void returnEscrow() {}
-  void enableAcceptors() {}
-  void disableAcceptors() {}
+  void requestStatus() {}
+  void enableAcceptor() {}
+  void disableAcceptor() {}
 
   Future<void> dispose() async {
     await _events.close();
